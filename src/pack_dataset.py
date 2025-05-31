@@ -1,7 +1,11 @@
+import logging
+import os
 import random
+import sys
 import warnings
 from typing import Optional
 
+import psutil
 import torch
 from torch.utils.data import IterableDataset
 import datasets
@@ -149,6 +153,45 @@ def data_generator(iterator, features=("input_ids", "labels")):
         yield {feature: x[feature] for feature in features}
 
 
+from typing import List, Optional
+import numpy as np
+from datasets import Features, Sequence, Value
+
+
+def group_texts(examples: List[List[int]], concat_token_id: Optional[int], sequence_length: int):
+    if concat_token_id is None:
+        concatenated_examples = np.concatenate(examples)
+    else:
+        concatenated_examples = np.concatenate([x + [concat_token_id] for x in examples])
+    total_length = len(concatenated_examples)
+
+    return {"input_ids": [
+        concatenated_examples[i: i + sequence_length] for i in
+        range(0, total_length - sequence_length + 1, sequence_length)
+    ]}
+
+
+def pack_dataset_fast(ds, tokenizer, seq_length, num_proc=-1, append_concat_token=True):
+    if num_proc == -1:
+        num_proc = psutil.cpu_count()
+
+    concat_token_id = getattr(tokenizer, 'eos_token_id', None)
+    if concat_token_id is None and append_concat_token:
+        raise ValueError("concat_token_id is not present")
+    if not append_concat_token:
+        logging.warning("Concat token will not be added")
+        concat_token_id = None
+
+    return ds.map(
+        lambda x: group_texts(x, concat_token_id, seq_length),
+        input_columns="input_ids",
+        remove_columns=ds.column_names,
+        batched=True,
+        features=Features({"input_ids": Sequence(feature=Value(dtype="int64"), length=seq_length)}),
+        num_proc=num_proc,
+    )
+
+
 def main(
         tokenizer_name: str,
         dataset_name: str,
@@ -158,6 +201,11 @@ def main(
         dataset_split: str = "train",
         append_concat_token: bool = True,
         max_in_memory_size: Optional[int] = None,
+        shuffle: bool = False,
+        limit_examples: Optional[int] = None,
+        seed: int = 42,
+        fast_packing: bool = False,
+        workers: int = -1,
 ):
     if max_in_memory_size is not None:
         datasets.config.IN_MEMORY_MAX_SIZE = max_in_memory_size
@@ -167,22 +215,49 @@ def main(
     else:
         ds = load_dataset(dataset_name, split=dataset_split)
 
-    ds_const = ConstantLengthDataset(
-        tokenizer=tokenizer,
-        dataset=ds,
-        formatting_func=lambda x: x["input_ids"],
-        shuffle=False,
-        seq_length=seq_length,
-        append_concat_token=append_concat_token,
-    )
+    logging.info(f"Loaded dataset {dataset_name} with {len(ds)} examples.")
 
-    packed_dataset = datasets.Dataset.from_generator(
-        data_generator, gen_kwargs={"iterator": ds_const, "features": ("input_ids",)}
-    )
+    if shuffle:
+        logging.info(f"Shuffling the dataset.")
+        ds = ds.shuffle(seed=seed)
+
+    if limit_examples is not None:
+        ds = ds.take(limit_examples)
+
+    logging.info(f"Starting packing dataset with {len(ds)} examples saving to {output_dir}.")
+
+    if fast_packing:
+        logging.warning("Using fast packing which might lose some examples.")
+        packed_dataset = pack_dataset_fast(
+            ds, tokenizer, seq_length, append_concat_token=append_concat_token, num_proc=workers
+        )
+    else:
+        if workers != -1:
+            logging.warning("Num workers will have no effect on slow packing")
+        ds_const = ConstantLengthDataset(
+            tokenizer=tokenizer,
+            dataset=ds,
+            formatting_func=lambda x: x["input_ids"],
+            shuffle=False,
+            seq_length=seq_length,
+            append_concat_token=append_concat_token,
+        )
+
+        packed_dataset = datasets.Dataset.from_generator(
+            data_generator, gen_kwargs={"iterator": ds_const, "features": ("input_ids",)}
+        )
+        logging.info(f"Finished packing the dataset with {len(packed_dataset)} packed examples.")
     packed_dataset.save_to_disk(output_dir)
 
 
 if __name__ == "__main__":
     import fire
+
+    logging.basicConfig(
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=os.environ.get("LOGLEVEL", "INFO").upper(),
+        stream=sys.stdout,
+    )
 
     fire.Fire(main)

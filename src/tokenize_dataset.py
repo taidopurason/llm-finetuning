@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 from typing import Optional
 
 
-def tokenize_dataset(ds, tokenizer, num_proc=-1, text_col="text", streaming=False):
+def tokenize_dataset(ds, tokenizer, num_proc=-1, text_col="text"):
     if num_proc == -1:
         num_proc = psutil.cpu_count()
 
@@ -31,11 +31,14 @@ def main(
         workers: int = -1,
         max_in_memory_size: Optional[int] = None,
         config_name: Optional[str] = None,
+        trust_remote_code: bool = False,
 ):
     if max_in_memory_size is not None:
         datasets.config.IN_MEMORY_MAX_SIZE = max_in_memory_size
 
-    ds = load_dataset(dataset_name, name=config_name, split=dataset_split, streaming=streaming)
+    ds = load_dataset(
+        dataset_name, name=config_name, split=dataset_split, streaming=streaming, trust_remote_code=trust_remote_code
+    )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     if shuffle:
@@ -54,7 +57,9 @@ def main(
             data_generator, gen_kwargs={"iterator": ds}, features=ds.features
         )
 
-    tokenized_dataset = tokenize_dataset(ds, tokenizer, text_col=text_col, num_proc=workers, streaming=streaming)
+    print(f"Tokenizing dataset with {len(ds)} examples")
+
+    tokenized_dataset = tokenize_dataset(ds, tokenizer, text_col=text_col, num_proc=workers)
     tokenized_dataset.save_to_disk(output_dir)
 
 if __name__ == "__main__":
