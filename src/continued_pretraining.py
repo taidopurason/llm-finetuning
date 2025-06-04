@@ -1,33 +1,28 @@
 # Adapted from https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/train.py
 # and https://github.com/facebookresearch/llama-recipes
 import logging
-import math
 import os
 import random
 import sys
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Optional, Tuple
 
 import datasets
+import numpy as np
 import torch
 from accelerate import PartialState
 from datasets import load_dataset, load_from_disk
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from transformers import HfArgumentParser, AutoModelForCausalLM, AutoTokenizer, \
-    PreTrainedTokenizer, get_polynomial_decay_schedule_with_warmup, \
-    PreTrainedModel, is_datasets_available
+    PreTrainedTokenizer, PreTrainedModel, is_datasets_available
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, SequentialSampler
 from transformers.trainer_utils import seed_worker
 from trl import SFTTrainer, SFTConfig
 
 HF_DATASET_TYPE = "huggingface"
 LOCAL_PACKED_HF_DATASET_TYPE = "huggingface_local_packed"
-MEGATRON_DATASET_TYPE = "megatron"
-DATASET_TYPES = [HF_DATASET_TYPE, MEGATRON_DATASET_TYPE, LOCAL_PACKED_HF_DATASET_TYPE]
+DATASET_TYPES = [HF_DATASET_TYPE, LOCAL_PACKED_HF_DATASET_TYPE]
 
 
 @dataclass
@@ -40,6 +35,18 @@ class ScriptArguments:
     )
     train_split_name: str = field(default="train")
     valid_split_name: str = field(default="validation")
+    valid_split_limit: Optional[int] = field(default=None)
+    train_weights: Optional[str] = field(default=None, metadata={"help": "Training data weights"})
+    train_reproducible_shuffle: bool = field(
+        default=False,
+        metadata={"help": "Use same shuffle regardless of the number of training samples "
+                          "works with huggingface_local_packed"}
+    )
+    train_dataset_num_samples: Optional[int] = field(default=None, metadata={
+        "help": "Number of training samples (for reproducible shuffle)"})
+    train_dataset_shuffle_frequency: Optional[int] = field(
+        default=None, metadata={"help": "Shuffle frequency for replicable shuffle (with combined dataset)"}
+    )
     valid_dataset_type: str = field(
         default=HF_DATASET_TYPE,
         metadata={"help": "Training dataset type", "choices": DATASET_TYPES}
@@ -59,7 +66,8 @@ class ScriptArguments:
     save_final_model: bool = field(default=False)
     calculate_chars_per_token: bool = field(default=False)
     stream_train_dataset: bool = field(default=False)
-    megatron_path_to_cache: Optional[str] = field(default=None)
+    stream_valid_dataset: bool = field(default=False)
+    add_position_ids: bool = field(default=False)
 
 
 @dataclass
@@ -82,23 +90,84 @@ def get_chars_per_token(dataset: Dataset, tokenizer: PreTrainedTokenizer, data_c
     return total_characters / total_tokens
 
 
+def create_position_ids(
+        input_ids,
+        bos_token_id=None,
+        eos_token_id=None,
+):
+    input_ids = np.asarray(input_ids)
+    n = input_ids.shape[0]
+    idx = np.arange(n, dtype=np.int32)
+
+    if bos_token_id is None:
+        is_bos = np.zeros(n, dtype=bool)
+    else:
+        is_bos = (input_ids == bos_token_id)
+
+    if eos_token_id is None:
+        is_eos = np.zeros(n, dtype=bool)
+    else:
+        shifted = np.empty(n, dtype=input_ids.dtype)
+        shifted[0] = -100
+        shifted[1:] = input_ids[:-1]
+        is_eos = (shifted == eos_token_id)
+
+    is_reset = is_bos | is_eos
+    is_reset[0] = True
+
+    reset_idx = np.where(is_reset, idx, -1)
+    last_reset = np.maximum.accumulate(reset_idx)
+
+    pos_ids = idx - last_reset
+    return pos_ids
+
+
 class HFLocalPackedDataset(Dataset):
-    def __init__(self, path):
+    def __init__(
+            self,
+            path,
+            add_position_ids: bool = False,
+            bos_token_id: Optional[int] = None,
+            eos_token_id: Optional[int] = None
+    ):
         self.dataset = load_from_disk(path)
+        self.add_position_ids = add_position_ids
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+
+        if self.add_position_ids:
+            if self.bos_token_id is None:
+                logging.warning("BOS token ID is not set for automatic positional_id calculation.")
+            if self.eos_token_id is None:
+                logging.warning("EOS token ID is not set for automatic positional_id calculation.")
+            if len(self.dataset) > 0:
+                if "attention_mask" in self.dataset[0]:
+                    logging.warning("Attention mask is present in the dataset, but positional ids will be added.")
+                if "positional_ids" in self.dataset[0]:
+                    logging.warning("Positional ids are already present in the dataset, new ids won't be created")
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         ds_object = self.dataset[idx]
-        return {
+        example = {
             "input_ids": torch.LongTensor(ds_object["input_ids"]),
             "labels": torch.LongTensor(ds_object.get("labels", ds_object["input_ids"])),
+            **{k: torch.LongTensor(ds_object[k]) for k in ["attention_mask", "position_ids"] if k in ds_object}
         }
+        if self.add_position_ids and "position_ids" not in ds_object:
+            example["position_ids"] = torch.LongTensor(
+                create_position_ids(
+                    ds_object["input_ids"], bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id
+                )
+            )
+        return example
+
 
 def create_dataset(
         path: str,
-        tokenizer,
+        tokenizer: PreTrainedTokenizer,
         args: ScriptArguments,
         training_args: CustomTrainingArguments,
         split: str = "train",
@@ -112,22 +181,45 @@ def create_dataset(
             return load_dataset(ds_name, lang, streaming=streaming, split=split)
         return load_dataset(path, streaming=streaming, split=split)
     if dataset_type == LOCAL_PACKED_HF_DATASET_TYPE:
-        return HFLocalPackedDataset(path)
-    if dataset_type == MEGATRON_DATASET_TYPE:
-        from megatron_dataset import load_megatron_dataset, MegatronDatasetWrapperHF
-        tokenizer_name = args.model_name if args.tokenizer_name is None else args.tokenizer_name
-        max_seq_length = training_args.max_seq_length
-        with PartialState().local_main_process_first():
-            ds = MegatronDatasetWrapperHF(load_megatron_dataset(
-                path,
-                tokenizer,
-                tokenizer_name,
-                max_seq_length,
+        from training_datasets import DatasetWrapper, CombinedDatasetWrapper
+        training_paths = path.split(",")
+        if args.train_reproducible_shuffle and not training_args.disable_dataloader_shuffle:
+            raise ValueError("Replicable shuffle is enabled but dataloader shuffle is not disabled "
+                             "use --disable_dataloader_shuffle")
+
+        if len(training_paths) == 1:
+            ds = HFLocalPackedDataset(
+                training_paths[0],
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                add_position_ids=args.add_position_ids,
+            )
+            if not args.train_reproducible_shuffle or split != "train":
+                return ds
+
+            return DatasetWrapper(
+                ds,
+                n_samples=args.train_dataset_num_samples,
                 seed=training_args.seed,
-                is_built_on_rank=lambda: True,
-                path_to_cache=args.megatron_path_to_cache
-            ))
-            return ds
+            )
+
+        dss = [
+            HFLocalPackedDataset(
+                p,
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                add_position_ids=args.add_position_ids,
+            )
+            for p in training_paths
+        ]
+        weights = [float(w) for w in args.train_weights.split(",")] if args.train_weights is not None else None
+        return CombinedDatasetWrapper(
+            datasets=dss,
+            weights=weights,
+            n_samples=args.train_dataset_num_samples,
+            seed=training_args.seed,
+            shuffle_frequency=args.train_dataset_shuffle_frequency,
+        )
 
     raise ValueError("Unsupported dataset type")
 
@@ -139,14 +231,44 @@ def create_train_dataset(tokenizer: PreTrainedTokenizer, args: ScriptArguments, 
     )
 
 
+def data_generator(iterator):
+    yield from iterator
+
+
+def _create_valid_dataset(
+        path: str,
+        tokenizer,
+        args: ScriptArguments,
+        training_args: CustomTrainingArguments,
+):
+    with PartialState().local_main_process_first():
+        valid_ds = create_dataset(
+            tokenizer=tokenizer, args=args, training_args=training_args, path=path, split=args.valid_split_name,
+            streaming=args.stream_valid_dataset, dataset_type=args.valid_dataset_type
+        )
+        if args.valid_split_limit is not None:
+            valid_ds = valid_ds.take(args.valid_split_limit)
+        if args.stream_valid_dataset:
+            valid_ds = datasets.Dataset.from_generator(
+                data_generator, gen_kwargs={"iterator": valid_ds}, features=valid_ds.features
+            )
+        return valid_ds
+
+
 def create_valid_dataset(tokenizer: PreTrainedTokenizer, args: ScriptArguments, training_args: CustomTrainingArguments):
+    logging.info(f"Creating validation dataset from: {args.valid_path}")
     if args.valid_path is None:
         return None
 
-    return create_dataset(
-        tokenizer=tokenizer, args=args, training_args=training_args, path=args.valid_path, split=args.valid_split_name,
-        streaming=False, dataset_type=args.valid_dataset_type
-    )
+    if len(args.valid_path.split(",")) == 1:
+        return _create_valid_dataset(args.valid_path, tokenizer, args, training_args)
+
+    valid_datasets = {}
+    for path in args.valid_path.split(","):
+        valid_name, *valid_path = path.split(":")
+        valid_path = ":".join(valid_path)
+        valid_datasets[valid_name] = _create_valid_dataset(valid_path, tokenizer, args, training_args)
+    return valid_datasets
 
 
 def create_and_prepare_model(
@@ -185,69 +307,7 @@ def create_and_prepare_model(
     return model, tokenizer
 
 
-def _get_cosine_schedule_with_warmup_lr_lambda(
-        current_step: int, *, num_warmup_steps: int, num_training_steps: int, num_cycles: float, lr_init: float = 1,
-        lr_end: float = 0
-):
-    if current_step < num_warmup_steps:
-        return float(current_step) / float(max(1, num_warmup_steps))
-    relative_lr_end = lr_end / lr_init
-    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))) * (
-            1 - relative_lr_end) + relative_lr_end
-
-
-def get_cosine_schedule_with_warmup_end_lr(
-        optimizer: Optimizer,
-        num_warmup_steps: int,
-        num_training_steps: int,
-        num_cycles: float = 0.5,
-        last_epoch: int = -1,
-        lr_end: float = 0,
-):
-    lr_init = optimizer.defaults["lr"]
-    lr_lambda = partial(
-        _get_cosine_schedule_with_warmup_lr_lambda,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
-        num_cycles=num_cycles,
-        lr_init=lr_init,
-        lr_end=lr_end,
-    )
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-
 class CustomSFTTrainer(SFTTrainer):
-    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
-        if (
-                self.lr_scheduler is None and
-                isinstance(self.args, CustomTrainingArguments) and
-                self.args.scheduler_lr_end is not None
-        ):
-            logging.info(
-                f"Using {self.args.lr_scheduler_type} with learning rate with end lr {self.args.scheduler_lr_end}"
-            )
-            if self.args.lr_scheduler_type == "polynomial":
-                self.lr_scheduler = get_polynomial_decay_schedule_with_warmup(
-                    optimizer=self.optimizer if optimizer is None else optimizer,
-                    lr_end=self.args.scheduler_lr_end,
-                    num_training_steps=num_training_steps,
-                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
-                )
-            elif self.args.lr_scheduler_type == "cosine":
-                self.lr_scheduler = get_cosine_schedule_with_warmup_end_lr(
-                    optimizer=self.optimizer if optimizer is None else optimizer,
-                    lr_end=self.args.scheduler_lr_end,
-                    num_training_steps=num_training_steps,
-                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
-                )
-            else:
-                raise ValueError(f"lr scheduler {self.args.lr_scheduler_type} not supported with scheduler_lr_end")
-            self._created_lr_scheduler = True
-            return self.lr_scheduler
-
-        return super().create_scheduler(num_training_steps, optimizer)
-
     def get_train_dataloader(self) -> DataLoader:
         """
         Returns the training [`~torch.utils.data.DataLoader`].
@@ -282,7 +342,7 @@ class CustomSFTTrainer(SFTTrainer):
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         if self.args.disable_dataloader_shuffle:
-            dataloader_params["sampler"] = None
+            dataloader_params["sampler"] = SequentialSampler(train_dataset)
             dataloader_params["shuffle"] = False
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
@@ -335,7 +395,11 @@ def main(script_args: ScriptArguments, training_args: CustomTrainingArguments):
 
     if script_args.save_final_model:
         final_out = os.path.join(training_args.output_dir, "last_checkpoint")
-        trainer.model.save_pretrained(final_out)
+        if trainer.is_fsdp_enabled:
+            trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+            trainer.save_model(final_out)
+        else:
+            trainer.model.save_pretrained(final_out)
         tokenizer.save_pretrained(final_out)
 
 

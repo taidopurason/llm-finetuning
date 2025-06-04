@@ -12,6 +12,7 @@ import datasets
 from transformers import AutoTokenizer
 from datasets import load_from_disk, load_dataset
 
+
 # Packing implementation directly taken from TRL
 # https://github.com/huggingface/trl/blob/4871c82b0cd1caae72522182f9171ea069481250/trl/trainer/utils.py#L546
 class ConstantLengthDataset(IterableDataset):
@@ -64,6 +65,7 @@ class ConstantLengthDataset(IterableDataset):
             shuffle=True,
             append_concat_token=True,
             add_special_tokens=True,
+            add_position_ids=False,
     ):
         self.tokenizer = tokenizer
         self.concat_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id else eos_token_id
@@ -75,6 +77,7 @@ class ConstantLengthDataset(IterableDataset):
         self.shuffle = shuffle
         self.append_concat_token = append_concat_token
         self.add_special_tokens = add_special_tokens
+        self.add_position_ids = add_position_ids
 
         if dataset_text_field is not None and formatting_func is not None:
             warnings.warn(
@@ -127,25 +130,51 @@ class ConstantLengthDataset(IterableDataset):
                 tokenized_inputs = self.tokenizer(
                     buffer, add_special_tokens=self.add_special_tokens, truncation=False
                 )["input_ids"]
-            all_token_ids = []
-            for tokenized_input in tokenized_inputs:
-                if self.append_concat_token:
-                    tokenized_input = tokenized_input + [self.concat_token_id]
-                all_token_ids.extend(tokenized_input)
-            examples = []
-            for i in range(0, len(all_token_ids), self.seq_length):
-                input_ids = all_token_ids[i: i + self.seq_length]
-                if len(input_ids) == self.seq_length:
-                    examples.append(input_ids)
-            if self.shuffle:
-                # Shuffle again, otherwise split examples occur in consecutive tensors.
-                random.shuffle(examples)
-            for example in examples:
-                self.current_size += 1
-                yield {
-                    "input_ids": torch.LongTensor(example),
-                    "labels": torch.LongTensor(example),
-                }
+
+            if self.add_position_ids:
+                yield from self._pack_with_position_ids(tokenized_inputs)
+            else:
+                yield from self._pack(tokenized_inputs)
+
+    def _pack(self, tokenized_inputs):
+        all_token_ids = []
+        for tokenized_input in tokenized_inputs:
+            if self.append_concat_token:
+                tokenized_input = tokenized_input + [self.concat_token_id]
+            all_token_ids.extend(tokenized_input)
+        examples = []
+        for i in range(0, len(all_token_ids), self.seq_length):
+            input_ids = all_token_ids[i: i + self.seq_length]
+            if len(input_ids) == self.seq_length:
+                examples.append({"input_ids": input_ids})
+        if self.shuffle:
+            random.shuffle(examples)
+        for example in examples:
+            self.current_size += 1
+            yield example
+
+    def _pack_with_position_ids(self, tokenized_inputs):
+        input_position_ids = [list(range(len(x))) for x in tokenized_inputs]
+        all_token_ids = []
+        all_position_ids = []
+        for tokenized_input, position_ids in zip(tokenized_inputs, input_position_ids):
+            if self.append_concat_token:
+                tokenized_input = tokenized_input + [self.concat_token_id]
+                position_ids = position_ids + [len(position_ids)]
+            all_token_ids.extend(tokenized_input)
+            all_position_ids.extend(position_ids)
+        examples = []
+        for i in range(0, len(all_token_ids), self.seq_length):
+            input_ids = all_token_ids[i: i + self.seq_length]
+            input_pos_ids = all_position_ids[i: i + self.seq_length]
+            if len(input_ids) == self.seq_length:
+                examples.append({"input_ids": input_ids, "position_ids": input_pos_ids})
+        if self.shuffle:
+            random.shuffle(examples)
+        for example in examples:
+            self.current_size += 1
+            yield example
+
 
 
 def data_generator(iterator, features=("input_ids", "labels")):
@@ -158,20 +187,38 @@ import numpy as np
 from datasets import Features, Sequence, Value
 
 
-def group_texts(examples: List[List[int]], concat_token_id: Optional[int], sequence_length: int):
+def group_texts(
+        examples: List[List[int]], concat_token_id: Optional[int], sequence_length: int, add_position_ids: bool = False
+) -> dict:
+    position_ids = None
     if concat_token_id is None:
         concatenated_examples = np.concatenate(examples)
+        if add_position_ids:
+            position_ids = np.concatenate([list(range(len(x))) for x in examples])
     else:
         concatenated_examples = np.concatenate([x + [concat_token_id] for x in examples])
+        if add_position_ids:
+            position_ids = np.concatenate([list(range(len(x) + 1)) for x in examples])
     total_length = len(concatenated_examples)
 
-    return {"input_ids": [
-        concatenated_examples[i: i + sequence_length] for i in
-        range(0, total_length - sequence_length + 1, sequence_length)
-    ]}
+    extra_fields = {}
+    if add_position_ids:
+        assert position_ids is not None
+        extra_fields["position_ids"] = [
+            position_ids[i: i + sequence_length] for i in
+            range(0, total_length - sequence_length + 1, sequence_length)
+        ]
+
+    return {
+        "input_ids": [
+            concatenated_examples[i: i + sequence_length] for i in
+            range(0, total_length - sequence_length + 1, sequence_length)
+        ],
+        **extra_fields,
+    }
 
 
-def pack_dataset_fast(ds, tokenizer, seq_length, num_proc=-1, append_concat_token=True):
+def pack_dataset_fast(ds, tokenizer, seq_length, num_proc=-1, append_concat_token=True, add_position_ids=False):
     if num_proc == -1:
         num_proc = psutil.cpu_count()
 
@@ -182,12 +229,21 @@ def pack_dataset_fast(ds, tokenizer, seq_length, num_proc=-1, append_concat_toke
         logging.warning("Concat token will not be added")
         concat_token_id = None
 
+    extra_columns = []
+    extra_features = {}
+    if add_position_ids:
+        extra_columns.append("position_ids")
+        extra_features["position_ids"] = Sequence(feature=Value(dtype="int64"), length=seq_length)
+
     return ds.map(
         lambda x: group_texts(x, concat_token_id, seq_length),
-        input_columns="input_ids",
+        input_columns=["input_ids"] + extra_columns,
         remove_columns=ds.column_names,
         batched=True,
-        features=Features({"input_ids": Sequence(feature=Value(dtype="int64"), length=seq_length)}),
+        features=Features({
+            "input_ids": Sequence(feature=Value(dtype="int64"), length=seq_length),
+            **extra_features
+        }),
         num_proc=num_proc,
     )
 
@@ -206,6 +262,7 @@ def main(
         seed: int = 42,
         fast_packing: bool = False,
         workers: int = -1,
+        add_position_ids: bool = False,
 ):
     if max_in_memory_size is not None:
         datasets.config.IN_MEMORY_MAX_SIZE = max_in_memory_size
@@ -229,7 +286,8 @@ def main(
     if fast_packing:
         logging.warning("Using fast packing which might lose some examples.")
         packed_dataset = pack_dataset_fast(
-            ds, tokenizer, seq_length, append_concat_token=append_concat_token, num_proc=workers
+            ds, tokenizer, seq_length,
+            append_concat_token=append_concat_token, num_proc=workers, add_position_ids=add_position_ids
         )
     else:
         if workers != -1:
@@ -241,10 +299,15 @@ def main(
             shuffle=False,
             seq_length=seq_length,
             append_concat_token=append_concat_token,
+            add_position_ids=add_position_ids,
         )
 
+        extra_features = []
+        if add_position_ids:
+            extra_features.append("position_ids")
+
         packed_dataset = datasets.Dataset.from_generator(
-            data_generator, gen_kwargs={"iterator": ds_const, "features": ("input_ids",)}
+            data_generator, gen_kwargs={"iterator": ds_const, "features": ("input_ids", *extra_features)}
         )
         logging.info(f"Finished packing the dataset with {len(packed_dataset)} packed examples.")
     packed_dataset.save_to_disk(output_dir)
