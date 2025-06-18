@@ -141,6 +141,8 @@ class CombinedDatasetWrapper(Dataset):
             seed: int = 1234,
             shuffle_frequency: Optional[int] = None,
     ):
+        if len(datasets) != len(weights):
+            raise ValueError("The number of datasets must match the number of weights provided.")
         self.seed = seed
         self.datasets = datasets
 
