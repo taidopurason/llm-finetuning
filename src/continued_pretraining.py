@@ -72,7 +72,6 @@ class ScriptArguments:
 
 @dataclass
 class CustomTrainingArguments(SFTConfig):
-    scheduler_lr_end: float = None
     disable_dataloader_shuffle: bool = False
 
 
