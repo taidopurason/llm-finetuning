@@ -68,6 +68,11 @@ class ScriptArguments:
     stream_train_dataset: bool = field(default=False)
     stream_valid_dataset: bool = field(default=False)
     add_position_ids: bool = field(default=False)
+    allow_empty_pad_token: bool = field(default=False)
+    position_ids_bos_token_id: Optional[int] = field(default=None)
+    position_ids_eos_token_id: Optional[int] = field(default=None)
+    pad_token: Optional[str] = field(default=None)
+
 
 
 @dataclass
@@ -186,11 +191,21 @@ def create_dataset(
             raise ValueError("Replicable shuffle is enabled but dataloader shuffle is not disabled "
                              "use --disable_dataloader_shuffle")
 
+        if args.position_ids_bos_token_id is None:
+            bos_token_id = tokenizer.bos_token_id
+        else:
+            bos_token_id = args.position_ids_bos_token_id
+
+        if args.position_ids_eos_token_id is None:
+            eos_token_id = tokenizer.eos_token_id
+        else:
+            eos_token_id = args.position_ids_bos_token_id
+
         if len(training_paths) == 1:
             ds = HFLocalPackedDataset(
                 training_paths[0],
-                bos_token_id=tokenizer.bos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                bos_token_id=bos_token_id,
+                eos_token_id=eos_token_id,
                 add_position_ids=args.add_position_ids,
             )
             if not args.train_reproducible_shuffle or split != "train":
@@ -205,8 +220,8 @@ def create_dataset(
         dss = [
             HFLocalPackedDataset(
                 p,
-                bos_token_id=tokenizer.bos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                bos_token_id=bos_token_id,
+                eos_token_id=eos_token_id,
                 add_position_ids=args.add_position_ids,
             )
             for p in training_paths
@@ -300,51 +315,28 @@ def create_and_prepare_model(
         padding_side="right",
     )
 
-    if tokenizer.pad_token is None:
+    if args.pad_token is not None:
+        logging.info(f"Setting pad token to {args.pad_token}")
+        tokenizer.pad_token = args.pad_token
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.model.padding_idx = tokenizer.pad_token_id
+        model.model.embed_tokens.padding_idx = tokenizer.pad_token_id
+
+    if tokenizer.pad_token is None and not args.allow_empty_pad_token:
+        logging.warning("Pad token is not set, using EOS token as pad token.")
         tokenizer.pad_token = tokenizer.eos_token
 
+    logging.info(f"Using pad token: {tokenizer.pad_token} ({tokenizer.pad_token_id})")
+    logging.info(f"Using eos token: {tokenizer.eos_token} ({tokenizer.eos_token_id})")
     return model, tokenizer
 
 
 class CustomSFTTrainer(SFTTrainer):
-    def get_train_dataloader(self) -> DataLoader:
-        """
-        Returns the training [`~torch.utils.data.DataLoader`].
-
-        Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
-        training if necessary) otherwise.
-
-        Subclass and override this method if you want to inject some custom behavior.
-        """
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
-
-        train_dataset = self.train_dataset
-        data_collator = self.data_collator
-        if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
-            train_dataset = self._remove_unused_columns(train_dataset, description="training")
-        else:
-            data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
-
-        dataloader_params = {
-            "batch_size": self._train_batch_size,
-            "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
-        }
-
-        if not isinstance(train_dataset, torch.utils.data.IterableDataset):
-            dataloader_params["sampler"] = self._get_train_sampler()
-            dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
-            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
-
-        if self.args.disable_dataloader_shuffle:
-            dataloader_params["sampler"] = SequentialSampler(train_dataset)
-            dataloader_params["shuffle"] = False
-
-        return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+        if isinstance(self.args, CustomTrainingArguments) and self.args.disable_dataloader_shuffle:
+            logging.info("Disabling training dataset shuffling")
+            return SequentialSampler(self.train_dataset)
+        return super()._get_train_sampler()
 
 
 def print_trainable_parameters(model):
