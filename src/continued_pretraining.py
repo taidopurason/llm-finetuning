@@ -14,11 +14,11 @@ from accelerate import PartialState
 from datasets import load_dataset, load_from_disk
 from tqdm import tqdm
 from transformers import HfArgumentParser, AutoModelForCausalLM, AutoTokenizer, \
-    PreTrainedTokenizer, PreTrainedModel, is_datasets_available
+    PreTrainedTokenizer, PreTrainedModel, Trainer, TrainingArguments, default_data_collator
 
-from torch.utils.data import Dataset, DataLoader, SequentialSampler
-from transformers.trainer_utils import seed_worker
-from trl import SFTTrainer, SFTConfig
+from torch.utils.data import Dataset, SequentialSampler
+
+from trl.trainer import ConstantLengthDataset
 
 HF_DATASET_TYPE = "huggingface"
 LOCAL_PACKED_HF_DATASET_TYPE = "huggingface_local_packed"
@@ -64,20 +64,29 @@ class ScriptArguments:
     low_cpu_mem_usage: bool = field(default=False)
     use_flash_attention_2: bool = field(default=False)
     save_final_model: bool = field(default=False)
-    calculate_chars_per_token: bool = field(default=False)
     stream_train_dataset: bool = field(default=False)
     stream_valid_dataset: bool = field(default=False)
     add_position_ids: bool = field(default=False)
     allow_empty_pad_token: bool = field(default=False)
-    position_ids_bos_token_id: Optional[int] = field(default=None)
-    position_ids_eos_token_id: Optional[int] = field(default=None)
+    position_ids_bos_token: Optional[str] = field(default=None)
+    position_ids_eos_token: Optional[str] = field(default=None)
     pad_token: Optional[str] = field(default=None)
-
+    max_seq_length: Optional[int] = None
+    eval_packing: bool = field(default=False)
+    dataset_text_field: str = field(default="text")
 
 
 @dataclass
-class CustomTrainingArguments(SFTConfig):
+class CustomTrainingArguments(TrainingArguments):
     disable_dataloader_shuffle: bool = False
+
+
+class CustomTrainer(Trainer):
+    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+        if isinstance(self.args, CustomTrainingArguments) and self.args.disable_dataloader_shuffle:
+            logging.info("Disabling training dataset shuffling")
+            return SequentialSampler(self.train_dataset)
+        return super()._get_train_sampler()
 
 
 # https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/utils.py#L116C1-L125C43
@@ -140,6 +149,7 @@ class HFLocalPackedDataset(Dataset):
         self.eos_token_id = eos_token_id
 
         if self.add_position_ids:
+            logging.info(f"Adding positional ids to the dataset using eos_token_id={self.eos_token_id} and bos_token_id={self.bos_token_id}")
             if self.bos_token_id is None:
                 logging.warning("BOS token ID is not set for automatic positional_id calculation.")
             if self.eos_token_id is None:
@@ -191,15 +201,15 @@ def create_dataset(
             raise ValueError("Replicable shuffle is enabled but dataloader shuffle is not disabled "
                              "use --disable_dataloader_shuffle")
 
-        if args.position_ids_bos_token_id is None:
+        if args.position_ids_bos_token is None:
             bos_token_id = tokenizer.bos_token_id
         else:
-            bos_token_id = args.position_ids_bos_token_id
+            bos_token_id = tokenizer.get_vocab()[args.position_ids_bos_token]
 
-        if args.position_ids_eos_token_id is None:
+        if args.position_ids_eos_token is None:
             eos_token_id = tokenizer.eos_token_id
         else:
-            eos_token_id = args.position_ids_bos_token_id
+            eos_token_id = tokenizer.get_vocab()[args.position_ids_eos_token]
 
         if len(training_paths) == 1:
             ds = HFLocalPackedDataset(
@@ -262,9 +272,19 @@ def _create_valid_dataset(
         )
         if args.valid_split_limit is not None:
             valid_ds = valid_ds.take(args.valid_split_limit)
+        if args.eval_packing:
+            valid_ds = ConstantLengthDataset(
+                tokenizer,
+                valid_ds,
+                infinite=False,
+                seq_length=args.max_seq_length,
+                chars_per_token=3.6,
+                dataset_text_field=args.dataset_text_field,
+                shuffle=False,
+            )
         if args.stream_valid_dataset:
             valid_ds = datasets.Dataset.from_generator(
-                data_generator, gen_kwargs={"iterator": valid_ds}, features=valid_ds.features
+                data_generator, gen_kwargs={"iterator": valid_ds}
             )
         return valid_ds
 
@@ -308,10 +328,11 @@ def create_and_prepare_model(
         low_cpu_mem_usage=args.low_cpu_mem_usage,
         **model_kwargs,
     )
+    model.config.use_cache = False
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name if args.tokenizer_name is None else args.tokenizer_name,
-        model_max_length=training_args.max_seq_length,
+        model_max_length=args.max_seq_length,
         padding_side="right",
     )
 
@@ -329,14 +350,6 @@ def create_and_prepare_model(
     logging.info(f"Using pad token: {tokenizer.pad_token} ({tokenizer.pad_token_id})")
     logging.info(f"Using eos token: {tokenizer.eos_token} ({tokenizer.eos_token_id})")
     return model, tokenizer
-
-
-class CustomSFTTrainer(SFTTrainer):
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        if isinstance(self.args, CustomTrainingArguments) and self.args.disable_dataloader_shuffle:
-            logging.info("Disabling training dataset shuffling")
-            return SequentialSampler(self.train_dataset)
-        return super()._get_train_sampler()
 
 
 def print_trainable_parameters(model):
@@ -362,23 +375,18 @@ def main(script_args: ScriptArguments, training_args: CustomTrainingArguments):
     model, tokenizer = create_and_prepare_model(
         script_args, training_args
     )
-    model.config.use_cache = False
 
     train_dataset = create_train_dataset(tokenizer, script_args, training_args)
     eval_dataset = create_valid_dataset(tokenizer, script_args, training_args)
 
-    if script_args.calculate_chars_per_token:
-        chars_per_token = get_chars_per_token(train_dataset, tokenizer, "text")
-        training_args.chars_per_token = chars_per_token
-        logging.info(f"Estimated chars per token: {chars_per_token}")
-
     logging.info(f"Max sequence length: {tokenizer.model_max_length}")
-    trainer = CustomSFTTrainer(
+    trainer = CustomTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        data_collator=default_data_collator,
     )
     trainer.accelerator.print(f"{trainer.model}")
     print_trainable_parameters(trainer.model)
