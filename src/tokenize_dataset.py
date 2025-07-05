@@ -32,12 +32,18 @@ def main(
         max_in_memory_size: Optional[int] = None,
         config_name: Optional[str] = None,
         trust_remote_code: bool = False,
+        force_redownload: bool = False,
 ):
     if max_in_memory_size is not None:
         datasets.config.IN_MEMORY_MAX_SIZE = max_in_memory_size
 
+    download_mode = None
+    if force_redownload:
+        download_mode = datasets.DownloadMode.FORCE_REDOWNLOAD
+
     ds = load_dataset(
-        dataset_name, name=config_name, split=dataset_split, streaming=streaming, trust_remote_code=trust_remote_code
+        dataset_name, name=config_name, split=dataset_split, streaming=streaming, trust_remote_code=trust_remote_code,
+        download_mode=download_mode,
     )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 

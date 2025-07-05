@@ -3,17 +3,16 @@ import os
 import random
 import sys
 import warnings
-from typing import Optional
+from typing import List, Optional
 
 import psutil
-import torch
+import numpy as np
 from torch.utils.data import IterableDataset
 import datasets
 from transformers import AutoTokenizer
-from datasets import load_from_disk, load_dataset
+from datasets import load_from_disk, load_dataset, Features, Sequence, Value
 
-
-# Packing implementation directly taken from TRL
+# Packing implementation adapted from TRL
 # https://github.com/huggingface/trl/blob/4871c82b0cd1caae72522182f9171ea069481250/trl/trainer/utils.py#L546
 class ConstantLengthDataset(IterableDataset):
     """
@@ -176,30 +175,32 @@ class ConstantLengthDataset(IterableDataset):
             yield example
 
 
-
 def data_generator(iterator, features=("input_ids", "labels")):
     for x in iterator:
         yield {feature: x[feature] for feature in features}
 
 
-from typing import List, Optional
-import numpy as np
-from datasets import Features, Sequence, Value
-
-
 def group_texts(
-        examples: List[List[int]], concat_token_id: Optional[int], sequence_length: int, add_position_ids: bool = False
+        input_ids: List[List[int]],
+        labels: Optional[List[List[int]]] = None,
+        sequence_length: int = 2048,
+        concat_token_id: Optional[int] = None,
+        add_position_ids: bool = False,
 ) -> dict:
     position_ids = None
     if concat_token_id is None:
-        concatenated_examples = np.concatenate(examples)
+        concatenated_input_ids = np.concatenate(input_ids)
+        if labels is not None:
+            concatenated_labels = np.concatenate(labels)
         if add_position_ids:
-            position_ids = np.concatenate([list(range(len(x))) for x in examples])
+            position_ids = np.concatenate([list(range(len(x))) for x in input_ids])
     else:
-        concatenated_examples = np.concatenate([x + [concat_token_id] for x in examples])
+        concatenated_input_ids = np.concatenate([x + [concat_token_id] for x in input_ids])
+        if labels is not None:
+            concatenated_labels = np.concatenate([x + [concat_token_id] for x in labels])
         if add_position_ids:
-            position_ids = np.concatenate([list(range(len(x) + 1)) for x in examples])
-    total_length = len(concatenated_examples)
+            position_ids = np.concatenate([list(range(len(x) + 1)) for x in input_ids])
+    total_length = len(concatenated_input_ids)
 
     extra_fields = {}
     if add_position_ids:
@@ -209,16 +210,23 @@ def group_texts(
             range(0, total_length - sequence_length + 1, sequence_length)
         ]
 
+    if labels is not None:
+        extra_fields["labels"] = [
+            concatenated_labels[i: i + sequence_length] for i in
+            range(0, total_length - sequence_length + 1, sequence_length)
+        ]
+
     return {
         "input_ids": [
-            concatenated_examples[i: i + sequence_length] for i in
+            concatenated_input_ids[i: i + sequence_length] for i in
             range(0, total_length - sequence_length + 1, sequence_length)
         ],
         **extra_fields,
     }
 
 
-def pack_dataset_fast(ds, tokenizer, seq_length, num_proc=-1, append_concat_token=True, add_position_ids=False):
+def pack_dataset_fast(ds, tokenizer, seq_length, num_proc=-1, append_concat_token=True, add_position_ids=False,
+                      add_labels=False):
     if num_proc == -1:
         num_proc = psutil.cpu_count()
 
@@ -229,15 +237,19 @@ def pack_dataset_fast(ds, tokenizer, seq_length, num_proc=-1, append_concat_toke
         logging.warning("Concat token will not be added")
         concat_token_id = None
 
-    extra_columns = []
     extra_features = {}
     if add_position_ids:
-        extra_columns.append("position_ids")
         extra_features["position_ids"] = Sequence(feature=Value(dtype="int64"), length=seq_length)
 
+    extra_fields = []
+    if add_labels:
+        extra_fields.append("labels")
+        extra_features["labels"] = Sequence(feature=Value(dtype="int64"), length=seq_length)
+
     return ds.map(
-        lambda x: group_texts(x, concat_token_id, seq_length),
-        input_columns=["input_ids"] + extra_columns,
+        lambda x, *y: group_texts(x, *y, concat_token_id=concat_token_id, sequence_length=seq_length,
+                                  add_position_ids=add_position_ids),
+        input_columns=["input_ids", *extra_fields],
         remove_columns=ds.column_names,
         batched=True,
         features=Features({
@@ -263,6 +275,7 @@ def main(
         fast_packing: bool = False,
         workers: int = -1,
         add_position_ids: bool = False,
+        add_labels: bool = False,
 ):
     if max_in_memory_size is not None:
         datasets.config.IN_MEMORY_MAX_SIZE = max_in_memory_size
@@ -287,7 +300,8 @@ def main(
         logging.warning("Using fast packing which might lose some examples.")
         packed_dataset = pack_dataset_fast(
             ds, tokenizer, seq_length,
-            append_concat_token=append_concat_token, num_proc=workers, add_position_ids=add_position_ids
+            append_concat_token=append_concat_token, num_proc=workers, add_position_ids=add_position_ids,
+            add_labels=add_labels,
         )
     else:
         if workers != -1:
@@ -310,6 +324,7 @@ def main(
             data_generator, gen_kwargs={"iterator": ds_const, "features": ("input_ids", *extra_features)}
         )
         logging.info(f"Finished packing the dataset with {len(packed_dataset)} packed examples.")
+    logging.info(f"Example: {packed_dataset[0]}")
     packed_dataset.save_to_disk(output_dir)
 
 
