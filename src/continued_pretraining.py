@@ -17,6 +17,7 @@ from transformers import HfArgumentParser, AutoModelForCausalLM, AutoTokenizer, 
     PreTrainedTokenizer, PreTrainedModel, Trainer, TrainingArguments, default_data_collator
 
 from torch.utils.data import Dataset, SequentialSampler
+import torch.nn.functional as F
 
 from trl.trainer import ConstantLengthDataset
 
@@ -74,6 +75,7 @@ class ScriptArguments:
     max_seq_length: Optional[int] = None
     eval_packing: bool = field(default=False)
     dataset_text_field: str = field(default="text")
+    add_padding: bool = field(default=False)
 
 
 @dataclass
@@ -141,15 +143,30 @@ class HFLocalPackedDataset(Dataset):
             path,
             add_position_ids: bool = False,
             bos_token_id: Optional[int] = None,
-            eos_token_id: Optional[int] = None
+            eos_token_id: Optional[int] = None,
+            add_padding: bool = False,
+            pad_token_id: Optional[int] = None,
+            max_length: Optional[int] = None,
     ):
         self.dataset = load_from_disk(path)
+
+        self.add_padding = add_padding
+        self.pad_token_id = pad_token_id
+        self.max_length = max_length
+        if self.add_padding:
+            if self.pad_token_id is None:
+                raise ValueError("Pad token ID must be set when add_padding is True")
+            if self.max_length is None:
+                raise ValueError("Padding max length must be set when add_padding is True")
+            logging.info(f"Padding dataset to max_length={self.max_length} with pad_token_id={self.pad_token_id}")
+
         self.add_position_ids = add_position_ids
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-
         if self.add_position_ids:
             logging.info(f"Adding positional ids to the dataset using eos_token_id={self.eos_token_id} and bos_token_id={self.bos_token_id}")
+            if self.add_padding:
+                raise ValueError("Cannot add positional ids and padding at the same time")
             if self.bos_token_id is None:
                 logging.warning("BOS token ID is not set for automatic positional_id calculation.")
             if self.eos_token_id is None:
@@ -176,6 +193,19 @@ class HFLocalPackedDataset(Dataset):
                     ds_object["input_ids"], bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id
                 )
             )
+        if self.add_padding:
+            seq_len = example["input_ids"].size(0)
+            if seq_len > self.max_length:
+                raise ValueError(f"Sequence length {seq_len} exceeds max_length={self.max_length}")
+            pad_len = self.max_length - seq_len
+
+            example["input_ids"] = F.pad(example["input_ids"], (0, pad_len), value=self.pad_token_id)
+            example["labels"] = F.pad(example["labels"], (0, pad_len), value=-100)
+
+            if "attention_mask" not in example:
+                example["attention_mask"] = torch.ones(seq_len, dtype=torch.long)
+            example["attention_mask"] = F.pad(example["attention_mask"], (0, pad_len), value=0)
+
         return example
 
 
@@ -217,6 +247,9 @@ def create_dataset(
                 bos_token_id=bos_token_id,
                 eos_token_id=eos_token_id,
                 add_position_ids=args.add_position_ids,
+                add_padding=args.add_padding,
+                pad_token_id=tokenizer.pad_token_id,
+                max_length=args.max_seq_length
             )
             if not args.train_reproducible_shuffle or split != "train":
                 return ds
@@ -233,10 +266,18 @@ def create_dataset(
                 bos_token_id=bos_token_id,
                 eos_token_id=eos_token_id,
                 add_position_ids=args.add_position_ids,
+                add_padding=args.add_padding,
+                pad_token_id=tokenizer.pad_token_id,
+                max_length=args.max_seq_length
             )
             for p in training_paths
         ]
-        weights = [float(w) for w in args.train_weights.split(",")] if args.train_weights is not None else None
+        if args.train_weights == "proportional":
+            weights = [len(ds) for ds in dss]
+            weights = np.array(weights, dtype=np.float64)
+            weights = weights / weights.sum()
+        else:
+            weights = [float(w) for w in args.train_weights.split(",")] if args.train_weights is not None else None
         return CombinedDatasetWrapper(
             datasets=dss,
             weights=weights,
@@ -312,6 +353,7 @@ def create_and_prepare_model(
         torch_dtype = args.torch_dtype
     else:
         torch_dtype = getattr(torch, args.torch_dtype)
+    logging.info(f"Using torch dtype: {torch_dtype}")
 
     model_kwargs = {}
 
