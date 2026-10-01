@@ -19,8 +19,6 @@ from transformers import HfArgumentParser, AutoModelForCausalLM, AutoTokenizer, 
 from torch.utils.data import Dataset, SequentialSampler
 import torch.nn.functional as F
 
-from trl.trainer import ConstantLengthDataset
-
 HF_DATASET_TYPE = "huggingface"
 LOCAL_PACKED_HF_DATASET_TYPE = "huggingface_local_packed"
 DATASET_TYPES = [HF_DATASET_TYPE, LOCAL_PACKED_HF_DATASET_TYPE]
@@ -164,7 +162,8 @@ class HFLocalPackedDataset(Dataset):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         if self.add_position_ids:
-            logging.info(f"Adding positional ids to the dataset using eos_token_id={self.eos_token_id} and bos_token_id={self.bos_token_id}")
+            logging.info(
+                f"Adding positional ids to the dataset using eos_token_id={self.eos_token_id} and bos_token_id={self.bos_token_id}")
             if self.add_padding:
                 raise ValueError("Cannot add positional ids and padding at the same time")
             if self.bos_token_id is None:
@@ -312,8 +311,12 @@ def _create_valid_dataset(
             streaming=args.stream_valid_dataset, dataset_type=args.valid_dataset_type
         )
         if args.valid_split_limit is not None:
-            valid_ds = valid_ds.take(args.valid_split_limit)
+            valid_ds = valid_ds.shuffle(seed=42)
+            if args.stream_valid_dataset or len(valid_ds) > args.valid_split_limit:
+                valid_ds.take(args.valid_split_limit)
         if args.eval_packing:
+            from trl.trainer import ConstantLengthDataset
+            #from pack_dataset import ConstantLengthDataset currently does not add labels, needs to be fixed
             valid_ds = ConstantLengthDataset(
                 tokenizer,
                 valid_ds,
@@ -323,10 +326,11 @@ def _create_valid_dataset(
                 dataset_text_field=args.dataset_text_field,
                 shuffle=False,
             )
-        if args.stream_valid_dataset:
+        if args.stream_valid_dataset or args.eval_packing:
             valid_ds = datasets.Dataset.from_generator(
                 data_generator, gen_kwargs={"iterator": valid_ds}
             )
+        logging.info(f"Created validation dataset from: {path} with {len(valid_ds)} examples.")
         return valid_ds
 
 
@@ -343,6 +347,7 @@ def create_valid_dataset(tokenizer: PreTrainedTokenizer, args: ScriptArguments, 
         valid_name, *valid_path = path.split(":")
         valid_path = ":".join(valid_path)
         valid_datasets[valid_name] = _create_valid_dataset(valid_path, tokenizer, args, training_args)
+    logging.info(f"Created validation datasets: {valid_datasets}")
     return valid_datasets
 
 
