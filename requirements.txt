@@ -1,0 +1,14 @@
+transformers==4.50.3
+trl==0.11.1
+accelerate==1.6.0
+datasets
+wandb
+peft
+optimum
+sentencepiece
+sacrebleu==2.4.3
+openai
+tiktoken
+jupyter
+fire
+tensorboard
