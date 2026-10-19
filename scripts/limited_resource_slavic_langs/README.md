@@ -21,9 +21,7 @@ Each example needs a `messages` list with `role` and `content`. Example:
       "content": "Swóju wědu wó drastwach a pšawem woblekanju co teke we workshopach nowo załožonego foruma dalej dawaś.",
       "role": "assistant"
     }
-  ],
-  "src_lang": "de",
-  "tgt_lang": "dsb"
+  ]
 }
 ```
 
@@ -83,6 +81,28 @@ pip install -r requirements.txt
 4. Run `sbatch scripts/limited_resource_slavic_langs/run_mt_sft.sh` from the repository root. Set the launcher's `runscript.sh` path to `${WORKING_DIR}/scripts/limited_resource_slavic_langs/runscript.sh` first.
 
 These launch scripts are for the LUMI supercomputer (Slurm). You may need to modify the resource settings, modules/container, paths, and launch command for your environment. They require the referenced Accelerate configuration and environment. Use a model with a chat template compatible with the script's Qwen-style user/assistant markers.
+
+## Joint instruction tuning and continued pretraining
+
+[run_joint_sft_cpt.sh](run_joint_sft_cpt.sh) runs `src/continued_pretraining.py` on a mixture of locally tokenized and packed datasets.
+
+Instruction data (including translation SFT) uses the same `messages` format shown above. Pretraining data uses a `text` field, as in [FineWeb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2):
+
+```json
+{"text": "A document in the target language..."}
+```
+
+1. Fill in `SCRIPT_PATH` (the repository's `src` directory), `OUT_PATH`, `ds_name`, and `config_name` in the preprocessing scripts. Use the same tokenizer and sequence length for all datasets and training.
+2. Run [preprocess_instruct.sh](data_preprocessing/preprocess_instruct.sh) for each instruction/translation dataset: tokenize with prompt masking, then pack while preserving labels. Run [preprocess_mono.sh](data_preprocessing/preprocess_mono.sh) for each text dataset: tokenize, then pack. Keep each dataset separate; mixing happens during training.
+3. Set `TRAIN_PATH` in `run_joint_sft_cpt.sh` to the resulting packed dataset directories. Set `TRAIN_WEIGHTS` in the same order, and configure `VALID_PATH` for held-out Hugging Face data (`test` split by default).
+4. Choose the training budget using packed sample counts: for dataset `i` with `N_i` packed samples and desired `E_i` passes, use `B_i = N_i * E_i`, `TRAIN_SAMPLES = sum(B_i)`, and weight `i = B_i / TRAIN_SAMPLES`. With `--num_train_epochs 1`, approximate optimizer steps are `ceil(TRAIN_SAMPLES / TOTAL_BATCH_SIZE)`. Adjust warmup/decay steps to match this budget.
+5. Set the LUMI account/project, environment, and paths, including `PYTHON_FILE`, the Accelerate configuration, and the container wrapper (`runscript_sm.sh`). From the repository root, submit:
+
+```sh
+sbatch scripts/limited_resource_slavic_langs/run_joint_sft_cpt.sh
+```
+
+Install the dependencies from `requirements.txt` as above. This launcher also targets LUMI and may need changes for your environment.
 
 ## Citation
 
